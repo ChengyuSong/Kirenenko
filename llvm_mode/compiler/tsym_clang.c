@@ -67,7 +67,7 @@ static void check_type(char *name) {
   } else {
     clang_type = CLANG_DFSAN_TYPE;
   }
-  if (!strcmp(name, "angora-clang++")) {
+  if (!strcmp(name, "tsym-clang++")) {
     is_cxx = 1;
   }
 }
