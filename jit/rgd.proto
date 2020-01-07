@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package rgd;
+
+service RGD {
+  rpc sendExpression (JitRequest) returns (JitReply) {}
+  rpc sendCmd (JitCmd) returns (JitReply) {}
+  rpc sendCmdv2 (JitCmdv2) returns (JitReply) {}
+}
+
+message JitCmdv2 {
+  uint32 cmd = 1; //reset;solve;expression
+  int32 test_value = 2; //this the value output by Z3
+	repeated JitRequest expr = 3; //
+}
+
+message JitCmd {
+  uint32 cmd = 1; //reset;solve;expression
+  int32 test_value = 2; //this the value output by Z3
+}
+
+// The request message containing the user's name.
+message JitRequest {
+  uint32 kind = 1;
+  uint32 boolvalue = 2;  //used by bool expr
+  uint32 bits = 3;
+  string value = 4;  //used by constant expr
+  repeated JitRequest children = 5;
+  string name = 6;  //used for debugging
+  uint32 index = 7;  //used by read expr for index and extract expr
+  uint32 label = 8;  //for expression dedup
+  uint32 hash = 9;  //for request dedup
+}
+
+// The response message containing the greetings
+message JitReply {
+  string message = 1;
+}

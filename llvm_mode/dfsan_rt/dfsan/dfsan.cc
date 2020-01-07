@@ -50,11 +50,17 @@
 
 using namespace __dfsan;
 
+
+/*rgdproxy*/
+void solveSingle(dfsan_label label, u8 result);
+void solveNested(dfsan_label label, u8 result);
+void initRGDProxy();
+
 typedef atomic_uint32_t atomic_dfsan_label;
 static const dfsan_label kInitializingLabel = -1;
 
 static atomic_dfsan_label __dfsan_last_label;
-static dfsan_label_info *__dfsan_label_info;
+dfsan_label_info *__dfsan_label_info;
 
 // taint source
 static struct taint_file tainted;
@@ -735,6 +741,9 @@ __taint_trace_cond(dfsan_label label, u8 r) {
     return;
   }
 
+	//rgdproxy
+	solveSingle(label,r);
+
   AOUT("solving cond: %u %u %u %p %u\n", label, r, __taint_trace_callstack, addr, itr->second);
   bool pushed = false;
   try {
@@ -974,6 +983,8 @@ static void dfsan_fini() {
 
 static void dfsan_init(int argc, char **argv, char **envp) {
   InitializeFlags();
+
+	initRGDProxy();
 
   InitializePlatformEarly();
   MmapFixedNoReserve(ShadowAddr(), UnusedAddr() - ShadowAddr());

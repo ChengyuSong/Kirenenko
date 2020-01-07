@@ -1,0 +1,731 @@
+#include <iostream>
+#include <memory>
+#include <string>
+#include <grpcpp/grpcpp.h>
+#include "helloworld.grpc.pb.h"
+#include <fstream>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <google/protobuf/io/zero_copy_stream_impl.h>
+
+using grpc::Channel;
+using grpc::ClientContext;
+using grpc::Status;
+using rgd::JitRequest;
+using rgd::JitCmd;
+using rgd::JitCmdv2;
+using rgd::JitReply;
+using rgd::RGD;
+using namespace google::protobuf::io;
+#include "expr.h"
+ExprRef createRead(uint32_t off);
+ExprRef createAdd(ExprRef o1, ExprRef o2);
+ExprRef createUlt(ExprRef o1, ExprRef o2);
+ExprRef createMul(ExprRef o1, ExprRef o2);
+ExprRef createNot(ExprRef o);
+ExprRef createLNot(ExprRef o);
+ExprRef createEqual(ExprRef o1, ExprRef o2);
+ExprRef createZExt(ExprRef o, unsigned int size);
+ExprRef createConstant(const char* rep, unsigned int width, unsigned int base);
+
+#define RECORD_EXPR 0
+//TODO: Ite, LNot/LAnd/LOr
+//TODO: test Extract
+
+ExprRef* __g_exprs = (ExprRef*)malloc(10000*sizeof(ExprRef));
+uint32_t g_idx;
+std::map<std::string, uint32_t> read_symbols;
+
+
+
+class RGDClient {
+	public:
+		RGDClient(std::shared_ptr<Channel> channel)
+			: stub_(RGD::NewStub(channel)) {}
+
+		void sendCmdv2(JitCmdv2* cmd) {
+			// Data we are sending to the server.
+			//JitRequest request;
+			//JitRequest *request1 = new JitRequest();
+			//request.set_name(user);
+			JitReply reply;
+
+			// Container for the data we expect from the server.
+
+			// Context for the client. It could be used to convey extra information to
+			// the server and/or tweak certain RPC behaviors.
+			ClientContext context;
+
+			// The actual RPC.
+			Status status = stub_->sendCmdv2(&context, *cmd, &reply);
+
+		}
+
+
+
+	private:
+		std::unique_ptr<RGD::Stub> stub_;
+};
+
+void codegen(ExprRef expr, JitRequest* ret);
+
+//reference: https://stackoverflow.com/questions/2340730/are-there-c-equivalents-for-the-protocol-buffers-delimited-i-o-functions-in-ja
+bool writeDelimitedTo(
+		const google::protobuf::MessageLite& message,
+		google::protobuf::io::ZeroCopyOutputStream* rawOutput) {
+	// We create a new coded stream for each message.  Don't worry, this is fast.
+	google::protobuf::io::CodedOutputStream output(rawOutput);
+
+	// Write the size.
+	const int size = message.ByteSize();
+	output.WriteVarint32(size);
+
+	uint8_t* buffer = output.GetDirectBufferForNBytesAndAdvance(size);
+	if (buffer != NULL) {
+		// Optimization:  The message fits in one buffer, so use the faster
+		// direct-to-array serialization path.
+		message.SerializeWithCachedSizesToArray(buffer);
+	} else {
+		// Slightly-slower path when the message is multiple buffers.
+		message.SerializeWithCachedSizes(&output);
+		if (output.HadError()) return false;
+	}
+
+	return true;
+}
+
+bool readDelimitedFrom(
+		google::protobuf::io::ZeroCopyInputStream* rawInput,
+		google::protobuf::MessageLite* message) {
+	// We create a new coded stream for each message.  Don't worry, this is fast,
+	// and it makes sure the 64MB total size limit is imposed per-message rather
+	// than on the whole stream.  (See the CodedInputStream interface for more
+	// info on this limit.)
+	google::protobuf::io::CodedInputStream input(rawInput);
+
+	// Read the size.
+	uint32_t size;
+	if (!input.ReadVarint32(&size)) return false;
+
+	// Tell the stream not to read beyond that size.
+	google::protobuf::io::CodedInputStream::Limit limit =
+		input.PushLimit(size);
+
+	// Parse the message.
+	if (!message->MergeFromCodedStream(&input)) return false;
+	if (!input.ConsumedEntireMessage()) return false;
+
+	// Release the limit.
+	input.PopLimit(limit);
+
+	return true;
+}
+
+
+void gdReset() {
+	std::cout << "reset gd" << std::endl;
+}
+
+void gdSolve() {
+	std::cout << "gd solve" << std::endl;
+}
+
+
+void sendCmd(int command) {
+	RGDClient greeter(grpc::CreateChannel(
+				"localhost:50051", grpc::InsecureChannelCredentials()));
+	JitCmdv2 cmd; 
+	cmd.set_cmd(command);
+#if RECORD_EXPR
+	mode_t mode =  S_IRUSR | S_IWUSR;
+	int fd = open("hello.data", O_CREAT | O_WRONLY | O_APPEND, mode);
+	ZeroCopyOutputStream* rawOutput = new google::protobuf::io::FileOutputStream(fd);
+	bool suc = writeDelimitedTo(cmd,rawOutput);
+	delete rawOutput;
+	sync();
+	close(fd);
+#endif
+	greeter.sendCmdv2(&cmd);
+}
+
+void hello_from_c() {
+	std::cout << "c string" << std::endl;
+}
+
+void sendSolve() {sendCmd(1);}
+
+void sendAssertion(void* assert) {
+	ExprRef t= *reinterpret_cast<ExprRef*>(assert);
+	std::cout << "going to send assertion " << t->toString() << std::endl;
+	RGDClient greeter(grpc::CreateChannel(
+				"localhost:50051", grpc::InsecureChannelCredentials()));
+	JitCmdv2 cmd;
+	cmd.set_cmd(2);
+	JitRequest* req = cmd.add_expr();
+	codegen(t,req);
+	greeter.sendCmdv2(&cmd);
+}
+
+void* buildRead(const char* symbol) {	
+	if (read_symbols.find(symbol) == read_symbols.end()) {
+		read_symbols[symbol] = read_symbols.size()-1;
+	}
+	__g_exprs[g_idx++] = createRead(read_symbols[symbol]);
+
+	void* ret = reinterpret_cast<void*>(&__g_exprs[g_idx-1]);
+	return ret;
+}
+
+void* buildZeroExtend(void* req, uint32_t size) {
+	ExprRef t= *reinterpret_cast<ExprRef*>(req);
+	__g_exprs[g_idx++] = createZExt(t,t->bits()+size);
+	return (void*)(&__g_exprs[g_idx-1]);
+}
+
+void* buildConstant(const char* rep, unsigned width, unsigned int base) {
+	ExprRef a = createConstant(rep,width,base);
+	__g_exprs[g_idx++] = a;
+	return (void*)(&__g_exprs[g_idx-1]);
+}
+
+void* buildAdd(void* req1, void* req2) {
+	ExprRef o1= *reinterpret_cast<ExprRef*>(req1);
+	ExprRef o2= *reinterpret_cast<ExprRef*>(req2);
+	__g_exprs[g_idx++] = createAdd(o1,o2);
+	return (void*)(&__g_exprs[g_idx-1]);
+}
+
+void* buildUlt(void* req1, void* req2) {
+	ExprRef o1= *reinterpret_cast<ExprRef*>(req1);
+	ExprRef o2= *reinterpret_cast<ExprRef*>(req2);
+	std::cout << "buildult o1 is " << o1->toString() << " and o2 is " << o2->toString() << std::endl;
+	__g_exprs[g_idx++] = createUlt(o1,o2);
+	return (void*)(&__g_exprs[g_idx-1]);
+}
+
+
+void* buildMul(void* req1, void* req2) {
+	ExprRef o1= *reinterpret_cast<ExprRef*>(req1);
+	ExprRef o2= *reinterpret_cast<ExprRef*>(req2);
+	__g_exprs[g_idx++] = createMul(o1,o2);
+	return (void*)(&__g_exprs[g_idx-1]);
+}
+
+
+void* buildEq(void* req1, void* req2) {
+	ExprRef o1= *reinterpret_cast<ExprRef*>(req1);
+	ExprRef o2= *reinterpret_cast<ExprRef*>(req2);
+	__g_exprs[g_idx++] = createEqual(o1,o2);
+	return (void*)(&__g_exprs[g_idx-1]);
+}
+
+
+void* buildNot(void* req) {
+	ExprRef o= *reinterpret_cast<ExprRef*>(req);
+	__g_exprs[g_idx++] = createLNot(o);
+	return (void*)(&__g_exprs[g_idx-1]);
+}
+
+
+void sendLabel(uint8_t result) {
+	RGDClient greeter(grpc::CreateChannel(
+				"localhost:50051", grpc::InsecureChannelCredentials()));
+
+	//printExpression(info);
+	//printf("%u %u %u %u %u %llu %llu\n", label, info->l1, info->l2,
+	//info->op, info->size, info->op1, info->op2);
+
+
+	//JitRequest req;
+	JitCmdv2 cmd;
+	cmd.set_cmd(2);
+	JitRequest* req = cmd.add_expr();
+	//req.set_test_value(value);
+	//codegen(req);
+#if RECORD_EXPR
+	mode_t mode =  S_IRUSR | S_IWUSR;
+	int fd = open("hello.data", O_CREAT | O_WRONLY | O_APPEND, mode);
+	ZeroCopyOutputStream* rawOutput = new google::protobuf::io::FileOutputStream(fd);
+	bool suc = writeDelimitedTo(cmd,rawOutput);
+	delete rawOutput;
+	sync();
+	close(fd);
+#endif
+	//std::string user("world");
+	//cmd.set_expr(req);
+	//std::string reply = greeter.sendCmdV2(&cmd);
+	greeter.sendCmdv2(&cmd);
+	//std::cout << "RGD received: " << reply << std::endl;
+}
+
+
+void codegen(ExprRef expression, JitRequest* ret) {
+  switch (expression->kind()) {
+    case Bool:
+     //getTrue is actually 1 bit integer 1
+     ret->set_kind(0);
+     ret->set_name("bool");
+     ret->set_bits(expression->bits());
+     if (BoolExprRef be = castAs<BoolExpr>(expression)) {
+       if(be->value())
+         ret -> set_boolvalue(1);
+         //ret = llvm::ConstantInt::getTrue(*mc->TheContext);
+       else
+         ret -> set_boolvalue(0);
+
+         //ret = llvm::ConstantInt::getFalse(*mc->TheContext);
+     }
+     break;
+    case Constant:
+     //std::cerr << "Constant expr codegen" << std::endl;
+     ret->set_kind(1);
+     ret->set_name("constant");
+     ret->set_bits(expression->bits());
+     if (ConstantExprRef ce = castAs<ConstantExpr>(expression)) {
+       //std::cerr << "Constant expr and bits is " << ce->bits() << std::endl;
+       //ret = llvm::ConstantInt::get(*mc->TheContext, ce->value());
+       ret->set_value(ce->value().toString(10,true));
+     }
+     //std::cerr << "Constant expr codegen done" << std::endl;
+     break;
+    case Read:
+     //std::cerr << "Read expr codegen" << std::endl;
+     ret->set_kind(2);
+     ret->set_bits(expression->bits());
+     ret->set_name("read");
+     if (ReadExprRef re = castAs<ReadExpr>(expression)) {
+        ret->set_index(re->index());
+     } 
+     //std::cerr << "Read expr codegen done" << std::endl;
+     //ret  = &(**g_args);
+     //return llvm::ConstantInt::get(llvm::Type::getInt64Ty(TheContext),0xFFFFFFFF);
+     break;
+    case Concat: {
+     //std::cerr << "Concat expr codegen" << std::endl;
+     ret -> set_kind(3);
+     ret->set_name("concat");
+     ret->set_bits(expression->bits());
+     ExprRef expression1 = expression->getChild(0);
+     ExprRef expression2 = expression->getChild(1);
+     uint32_t bits =  expression1->bits() + expression2->bits(); 
+     //std::cerr << "Concat bits is " << expression1->bits() << " and bits is " << expression2->bits() << "and self's bits is " << expression->bits() << std::endl;
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //std::cerr << "Concat expr codegen done" << std::endl;
+     //llvm::Value* arg1 = Builder->CreateZExt(codegen(expression1,mc),llvm::Type::getIntNTy(*mc->TheContext,bits));
+     //llvm::Value* arg2 = Builder->CreateZExt(codegen(expression2,mc),llvm::Type::getIntNTy(*mc->TheContext,bits));
+     //llvm::Value* arg11 = Builder->CreateShl(arg1,expression2->bits());
+     //ret = Builder->CreateOr(arg11,arg2);
+     //ret =  Builder->CreateAdd(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Concat");
+     break;
+     }
+    case Extract: {
+     //std::cerr << "Extract expr code gen" << std::endl;
+     ret->set_kind(4);
+     ret->set_name("extract");
+     ret->set_bits(expression->bits());
+     JitRequest* child = ret->add_children();
+     codegen(expression->getChild(0),child);
+     if (ExtractExprRef ee = castAs<ExtractExpr>(expression)) {
+       //std::cerr << "Extract index is " << ee->index() << std::endl;
+       ret->set_index(ee->index());
+       //llvm::Value* arg1 = Builder->CreateLShr(codegen(expression->getChild(0),mc),ee->index());
+       //ret = Builder->CreateTrunc(arg1,llvm::Type::getIntNTy(*mc->TheContext,ee->bits()));
+     }
+     //std::cerr << "Extract expr code gen done" << std::endl;
+     break;
+    }
+    case ZExt: {
+    // std::cerr << "ZExt the bits is " << expression->bits() << std::endl;
+     ret -> set_kind(5);
+     ret->set_name("zext");
+     ret->set_bits(expression->bits());
+     JitRequest* child = ret->add_children();
+     codegen(expression->getChild(0),child);
+     //ret = Builder->CreateZExt(codegen(expression->getChild(0),mc),llvm::Type::getIntNTy(*mc->TheContext,expression->bits()));
+     break;
+    }
+    case SExt: {
+     //std::cerr << "SExt the bits is " << expression->bits() << std::endl;
+     ret->set_kind(6);
+     ret->set_name("sext");
+     ret->set_bits(expression->bits());
+     JitRequest* child = ret->add_children();
+     codegen(expression->getChild(0),child);
+     //ret = Builder->CreateSExt(codegen(expression->getChild(0),mc),llvm::Type::getIntNTy(*mc->TheContext,expression->bits()));
+     //std::cerr << "SExt expr code gen done" << std::endl;
+     break;
+    }
+    case Add: {
+     ret->set_kind(7);
+     ret->set_name("add");
+     ret->set_bits(expression->bits());
+     //std::cerr <<"Add expr codegen" << std::endl;
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //std::cerr <<"Add expr codegen finished" << std::endl;
+     //ret = Builder->CreateAdd(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Add");
+     break;
+    }
+    case Sub: {
+     ret->set_kind(8);
+     ret->set_name("sub");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateSub(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Sub");
+     break;
+    }
+    case Mul: {
+     ret->set_kind(9);
+     ret->set_name("mul");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateMul(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Mul");
+     break;
+    }
+    case UDiv: {
+     ret->set_kind(10);
+     ret->set_name("udiv");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateUDiv(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "UDiv");
+     break;
+    }
+    case SDiv: {
+     ret->set_kind(11);
+     ret->set_name("sdiv");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret =Builder->CreateSDiv(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "SDiv");
+     break;
+    }
+    case URem: {
+     ret->set_kind(12);
+     ret->set_name("urem");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateURem(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "URem");
+     break;
+    }
+    case SRem: {
+     ret->set_kind(13);
+     ret->set_name("srem");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateSRem(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "SRem");
+     break;
+    }
+    case Neg: {
+     ret->set_kind(14);
+     ret->set_name("neg");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     //ret = Builder->CreateNeg(codegen(expression->getChild(0),mc), "Neg");
+     break;
+    }
+    case Not: {
+     ret->set_kind(15);
+     ret->set_name("not");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     //ret = Builder->CreateNot(codegen(expression->getChild(0),mc), "Not");
+     break;
+    }
+    case And: {
+     ret->set_kind(16);
+     ret->set_name("and");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateAnd(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "And");
+     break;
+    }
+    case Or: {
+     ret->set_kind(17);
+     ret->set_name("or");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateOr(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Or");
+     break;
+    }
+    case Xor: {
+     ret->set_kind(18);
+     ret->set_name("xor");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateXor(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Xor");
+     break;
+    }
+    case Shl: {
+     ret->set_kind(19);
+     ret->set_name("shl");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret =Builder->CreateShl(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Shl");
+     break;
+    }
+    case LShr: {
+     ret->set_kind(20);
+     ret->set_name("lshr");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateLShr(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "LShr");
+     break;
+    }
+    case AShr: {
+     ret->set_kind(21);
+     ret->set_name("ashr");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateAShr(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "AShr");
+     break;
+    }
+    case Equal: {
+     //std::cerr << "Equal expr codegen and kind is" << expression->kind() <<  std::endl;
+     ret->set_kind(22);
+     ret->set_name("equal");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpEQ(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Equal");
+     break;
+    }
+    case Distinct: {
+     ret->set_kind(23);
+     ret->set_name("distinct");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpNE(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Distinct");
+     break;
+    }
+    case Ult: {
+     ret->set_kind(24);
+     ret->set_name("ult");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpULT(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Ult");
+     break;
+    }
+    case Ule: {
+     ret->set_kind(25);
+     ret->set_name("ule");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpULE(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Ule");
+     break;
+    }
+    case Ugt: {
+     ret->set_kind(26);
+     ret->set_name("ugt");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpUGT(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Ugt");
+     break;
+    }
+    case Uge: {
+     ret->set_kind(27);
+     ret->set_name("uge");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpUGE(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Uge");
+     break;
+    }
+    case Slt: {
+     ret->set_kind(28);
+     ret->set_name("slt");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpSLT(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Slt");
+     break;
+    }
+    case Sle: {
+     ret->set_kind(29);
+     ret->set_name("sle");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpSLE(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Sle");
+     break;
+    }
+    case Sgt: {
+     ret->set_kind(30);
+     ret->set_name("sgt");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpSGT(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Sgt");
+     break;
+    }
+    case Sge: {
+     ret->set_kind(31);
+     ret->set_name("sge");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateICmpSGE(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "Sge");
+     break;
+    }
+    //FIXME fix or and and not
+    case LOr: {
+     ret->set_kind(32);
+     ret->set_name("lor");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateOr(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "LOr");
+     break;
+    }
+    case LAnd: {
+     ret->set_kind(33);
+     ret->set_name("land");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     //ret = Builder->CreateAnd(codegen(expression->getChild(0),mc),  codegen(expression->getChild(1),mc), "LAnd");
+     break;
+    }
+    case LNot: {
+     ret->set_kind(34);
+     ret->set_name("lnot");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     //ret = Builder->CreateNot(codegen(expression->getChild(0),mc), "LNot");
+     break;
+    }
+    case Ite: {
+     ret->set_kind(35);
+     ret->set_name("ite");
+     ret->set_bits(expression->bits());
+     JitRequest* child0 = ret->add_children();
+     JitRequest* child1 = ret->add_children();
+     JitRequest* child2 = ret->add_children();
+     codegen(expression->getChild(0),child0);
+     codegen(expression->getChild(1),child1);
+     codegen(expression->getChild(2),child2);
+     /*
+     llvm::Value *CondV = codegen(expression->getChild(0),mc);
+     if (!CondV)
+       return nullptr;
+
+     llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+     // Create blocks for the then and else cases.  Insert the 'then' block at the
+     // end of the function.
+     llvm::BasicBlock *ThenBB = llvm::BasicBlock::Create(*mc->TheContext, "then", TheFunction);
+     llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(*mc->TheContext, "else");
+     llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(*mc->TheContext, "ifcont");
+
+     Builder->CreateCondBr(CondV, ThenBB, ElseBB);
+
+     // Emit then value.
+     Builder->SetInsertPoint(ThenBB);
+
+     llvm::Value *ThenV = codegen(expression->getChild(1),mc);
+     if (!ThenV)
+       return nullptr;
+
+     Builder->CreateBr(MergeBB);
+     // Codegen of 'Then' can change the current block, update ThenBB for the PHI.
+     ThenBB = Builder->GetInsertBlock();
+
+     // Emit else block.
+     TheFunction->getBasicBlockList().push_back(ElseBB);
+     Builder->SetInsertPoint(ElseBB);
+
+     llvm::Value *ElseV = codegen(expression->getChild(2),mc);
+     if (!ElseV)
+       return nullptr;
+
+     Builder->CreateBr(MergeBB);
+     // Codegen of 'Else' can change the current block, update ElseBB for the PHI.
+     ElseBB = Builder->GetInsertBlock();
+
+     // Emit merge block.
+     TheFunction->getBasicBlockList().push_back(MergeBB);
+     Builder->SetInsertPoint(MergeBB);
+     llvm::PHINode *PN = Builder->CreatePHI(llvm::Type::getDoubleTy(*mc->TheContext), 2, "iftmp");
+
+     PN->addIncoming(ThenV, ThenBB);
+     PN->addIncoming(ElseV, ElseBB);
+     ret =  PN;
+     break; */
+     }
+    default:
+     break;
+  }
+  return; 
+}
