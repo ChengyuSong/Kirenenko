@@ -1652,7 +1652,7 @@ __dfsw_mmap(void *start, size_t length, int prot, int flags, int fd,
             dfsan_label fd_label, dfsan_label offset_label,
             dfsan_label *ret_label) {
   void *ret = mmap(start, length, prot, flags, fd, offset);
-  if (ret > 0) {
+  if (ret != MAP_FAILED) {
     off_t fsize = taint_get_file(fd);
     if (fsize) {
       AOUT("mmap tainted file at addr %p, offset: %lld, length %lld \n",

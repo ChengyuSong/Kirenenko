@@ -63,7 +63,7 @@ add_custom_command(OUTPUT ${dfsan_abilist_filename}
                    DEPENDS done_abilist.txt libc_ubuntu1804_abilist.txt)
 add_dependencies(dfsan dfsan_abilist)
 install(FILES ${dfsan_abilist_filename}
-  DESTINATION ${ANGORA_RULE_DIR})
+  DESTINATION ${KIRENENKO_RULE_DIR})
 
 set(taint_linker_script_filename ${COMPILER_RT_OUTPUT_DIR}/taint.ld)
 add_custom_target(taint_linker_script ALL

@@ -47,7 +47,7 @@ echo core | sudo tee /proc/sys/kernel/core_pattern
 Running test from Angora
 ```
 cd /path-to-angora/tests/mini
-../../bin/tsym-clang mini.c -o mini.taint
+../../bin/ko-clang mini.c -o mini.taint
 python -c "print('A'*20)" > i
 TAINT_OPTIONS="taint_file=i" ./mini.taint i
 ./mini.taint id-0-0-0
