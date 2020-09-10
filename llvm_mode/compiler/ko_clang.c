@@ -265,7 +265,7 @@ static void edit_params(u32 argc, char **argv) {
     //cc_params[cc_par_cnt++] = "-funroll-loops";
   }
 
-  if (is_cxx) {
+  if (0 && is_cxx) {
     // FIXME: or use the same header
     // cc_params[cc_par_cnt++] = "-I/path-to-llvm/include/c++/v1";
     cc_params[cc_par_cnt++] = alloc_printf("-L%s/lib/libcxx_track/", obj_path);

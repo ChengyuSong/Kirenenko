@@ -400,31 +400,6 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n) {
     return;
   }
 
-  // fast path 4: Concat
-  if (is_kind_of_label(l, Concat)) {
-    if (n * 8 == info->size) {
-      dfsan_label cur = info->l2; // next label
-      dfsan_label_info* cur_info = get_label_info(cur);
-      // store current
-      __taint_union_store(info->l2, &ls[n - cur_info->size / 8], cur_info->size / 8);
-      // store base
-      __taint_union_store(info->l1, ls, n - cur_info->size / 8);
-      return;
-    }
-  }
-
-  // simplify
-  if (is_kind_of_label(l, ZExt)) {
-    dfsan_label orig = info->l1;
-    // if the base size is multiple of byte
-    if ((get_label_info(orig)->size & 0x7) == 0) {
-      for (uptr i = get_label_info(orig)->size / 8; i < n; ++i)
-        ls[i] = 0;
-      __taint_union_store(orig, ls, get_label_info(orig)->size / 8);
-      return;
-    }
-  }
-
   // default fall through
   for (uptr i = 0; i < n; ++i) {
     ls[i] = __taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
