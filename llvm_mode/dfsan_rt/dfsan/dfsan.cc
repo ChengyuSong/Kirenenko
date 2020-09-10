@@ -714,7 +714,9 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   }
   z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2, size);
   if (info->l2 >= CONST_OFFSET) {
-    op2 = serialize(info->l2, deps).simplify();
+    std::unordered_set<u32> deps2;
+    op2 = serialize(info->l2, deps2).simplify();
+    deps.insert(deps2.begin(),deps2.end());
   } else if (info->size == 1) {
     op2 = __z3_context.bool_val(info->op2 == 1);
   }
