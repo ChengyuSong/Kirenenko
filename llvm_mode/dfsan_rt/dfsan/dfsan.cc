@@ -51,6 +51,7 @@
 #include <vector>
 
 #define OPTIMISTIC 1
+#define RESTRICT_CONSTRAINT 1
 
 using namespace __dfsan;
 
@@ -99,7 +100,16 @@ struct expr_equal {
     return lhs.id() == rhs.id();
   }
 };
+
+#if RESTRICT_CONSTRAINT
+typedef struct {
+  std::unordered_set<z3::expr,expr_hash,expr_equal> exprs;
+  std::unordered_set<dfsan_label> deps;
+} branch_dep_t;
+#else
 typedef std::unordered_set<z3::expr, expr_hash, expr_equal> branch_dep_t;
+#endif
+
 static std::vector<branch_dep_t*> *__branch_deps;
 
 Flags __dfsan::flags_data;
@@ -787,6 +797,30 @@ add_constraints(dfsan_label label) {
   try {
     std::unordered_set<dfsan_label> inputs;
     z3::expr cond = serialize(label, inputs);
+#if RESTRICT_CONSTRAINT
+    branch_dep_t* the_tree = nullptr;
+    for (auto off : inputs) {
+      auto c = __branch_deps->at(off);
+      if (c == nullptr) {
+        c = new branch_dep_t();
+      }
+      if (the_tree == nullptr) {
+        the_tree = c;
+      }
+      else  {
+        the_tree->exprs.insert(c->exprs.begin(),c->exprs.end());
+        the_tree->deps.insert(c->deps.begin(),c->deps.end());
+        for (auto &idx : c->deps) {
+          __branch_deps->at(idx) = the_tree;
+        }
+      }
+      __branch_deps->at(off) = the_tree;
+    }
+    the_tree->exprs.insert(cond);
+    for (auto off : inputs) {
+    the_tree->deps.insert(off);
+  }
+#else
     for (auto off : inputs) {
       auto c = __branch_deps->at(off);
       if (c == nullptr) {
@@ -795,6 +829,7 @@ add_constraints(dfsan_label label) {
       }
       c->insert(cond);
     }
+#endif
   } catch (z3::exception e) {
     Report("WARNING: adding constraints error: %s\n", e.msg());
   }
@@ -820,11 +855,16 @@ static void __solve_cond(dfsan_label label, z3::expr &result, void *addr) {
 
     __z3_solver.reset();
     // add dependencies
-    branch_dep_t added;
+    //branch_dep_t added;
+    std::unordered_set<z3::expr,expr_hash,expr_equal> added;
     for (auto off : inputs) {
       auto c = __branch_deps->at(off);
       if (c) {
+#if RESTRICT_CONSTRAINT
+        for (auto &expr : c->exprs) {
+#else
         for (auto &expr : *c) {
+#endif
           if (added.insert(expr).second) {
             //AOUT("adding expr: %s\n", expr.to_string().c_str());
             __z3_solver.add(expr);
@@ -856,7 +896,31 @@ static void __solve_cond(dfsan_label label, z3::expr &result, void *addr) {
       }
 #endif
     }
-
+#if RESTRICT_CONSTRAINT
+    // nested branch
+    branch_dep_t* the_tree = nullptr;
+    for (auto off : inputs) {
+      auto c = __branch_deps->at(off);
+      if (c == nullptr) {
+        c = new branch_dep_t();
+      }
+      if (the_tree == nullptr) {
+        the_tree = c;
+      }
+      else  {
+        the_tree->exprs.insert(c->exprs.begin(),c->exprs.end());
+        the_tree->deps.insert(c->deps.begin(),c->deps.end());
+        for (auto &idx : c->deps) {
+          __branch_deps->at(idx) = the_tree;
+        }
+      }
+      __branch_deps->at(off) = the_tree;
+    }
+    the_tree->exprs.insert(cond);
+    for (auto off : inputs) {
+      the_tree->deps.insert(off);
+    }
+#else
     // nested branch
     for (auto off : inputs) {
       auto c = __branch_deps->at(off);
@@ -866,7 +930,7 @@ static void __solve_cond(dfsan_label label, z3::expr &result, void *addr) {
       }
       c->insert(cond == result);
     }
-
+#endif
     // mark as flipped
     get_label_info(label)->flags |= B_FLIPPED;
   } catch (z3::exception e) {
@@ -951,11 +1015,16 @@ __taint_trace_gep(dfsan_label label, u64 r) {
 
     __z3_solver.reset();
     // add dependencies
-    branch_dep_t added;
+    //branch_dep_t added;
+    std::unordered_set<z3::expr,expr_hash,expr_equal> added;
     for (auto off : inputs) {
       auto c = __branch_deps->at(off);
       if (c) {
+#if RESTRICT_CONSTRAINT
+        for (auto &expr : c->exprs) {
+#else
         for (auto &expr : *c) {
+#endif
           if (added.insert(expr).second) {
             __z3_solver.add(expr);
           }
@@ -992,8 +1061,13 @@ __taint_trace_gep(dfsan_label label, u64 r) {
         c = new branch_dep_t();
         __branch_deps->at(off) = c;
       }
+#if RESTRICT_CONSTRAINT
+      c->exprs.insert(index == result);
+#else
       c->insert(index == result);
+#endif
     }
+
 
     // mark as visited
     get_label_info(label)->flags |= B_FLIPPED;
